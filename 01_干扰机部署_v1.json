@@ -1,0 +1,17 @@
+{
+    "jammer": {
+        "capability": 10,
+        "communicationJammerNumber": 5,
+        "radarJammingNumber": 5
+    },
+    "scene": {
+        "altitude": "0",
+        "latitude": "40.08",
+        "longitude": "116.584",
+        "projectname": "faeef",
+        "radius": 10000,
+        "rangeType": "circle",
+        "viewPort": "116.58245000 40.05790000 65741.02736812"
+    },
+    "type": "generate"
+}

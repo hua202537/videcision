@@ -1,0 +1,9 @@
+Flask
+Flask-Cors
+Flask-MQTT
+waitress
+matplotlib
+numpy
+pyproj
+pyswarm
+paho-mqtt

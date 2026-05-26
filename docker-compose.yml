@@ -1,0 +1,27 @@
+services:
+  decision-service:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: decision-service
+    ports:
+      - "${HOST_PORT:-17686}:${PORT:-17686}"
+    env_file:
+      - .env
+    environment:
+      HOST: ${HOST:-0.0.0.0}
+      PORT: ${PORT:-17686}
+      SOURCE_BROKER: ${SOURCE_BROKER:-host.docker.internal}
+      SOURCE_PORT: ${SOURCE_PORT:-1883}
+      SOURCE_USERNAME: ${SOURCE_USERNAME:-1}
+      SOURCE_PASSWORD: ${SOURCE_PASSWORD:-1}
+    volumes:
+      - ./logs:/app/logs
+      - ./data:/app/data
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:17686/api/status', timeout=3).getcode()==200 else 1)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    restart: unless-stopped
