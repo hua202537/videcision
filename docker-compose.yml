@@ -4,22 +4,29 @@ services:
       context: .
       dockerfile: Dockerfile
     container_name: decision-service
+    # 宿主机 HOST_PORT -> 容器内 PORT（与 .env / Dockerfile EXPOSE 一致）
     ports:
-      - "${HOST_PORT:-17686}:${PORT:-17686}"
+      - "${HOST_PORT:-30517}:${PORT:-17686}"
     env_file:
       - .env
     environment:
       HOST: ${HOST:-0.0.0.0}
       PORT: ${PORT:-17686}
-      SOURCE_BROKER: ${SOURCE_BROKER:-host.docker.internal}
-      SOURCE_PORT: ${SOURCE_PORT:-1883}
-      SOURCE_USERNAME: ${SOURCE_USERNAME:-1}
-      SOURCE_PASSWORD: ${SOURCE_PASSWORD:-1}
+      SOURCE_BROKER: ${SOURCE_BROKER:-172.16.10.13}
+      SOURCE_PORT: ${SOURCE_PORT:-30502}
+      SOURCE_USERNAME: ${SOURCE_USERNAME:-test}
+      SOURCE_PASSWORD: ${SOURCE_PASSWORD:-test}
     volumes:
       - ./logs:/app/logs
       - ./data:/app/data
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:17686/api/status', timeout=3).getcode()==200 else 1)"]
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import os,urllib.request,sys; p=os.getenv('PORT','17686'); sys.exit(0 if urllib.request.urlopen(f'http://127.0.0.1:{p}/api/status', timeout=3).getcode()==200 else 1)",
+        ]
       interval: 30s
       timeout: 5s
       retries: 3

@@ -1,12 +1,16 @@
 import os
 import json
 import time
+import math
+import random
 import logging
 import builtins
 import sys
 import io
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
+
+from pyproj import Transformer, CRS
 from logging.handlers import RotatingFileHandler
 from queue import Queue
 
@@ -153,10 +157,18 @@ def _handle_unexpected_http_error(e):
     }), 500
 
 # ---------- MQTT 配置 ----------
-app.config['MQTT_BROKER_URL'] = os.getenv("SOURCE_BROKER", "127.0.0.1")
-app.config['MQTT_BROKER_PORT'] = int(os.getenv("SOURCE_PORT", 1883))
-app.config['MQTT_USERNAME'] = os.getenv("SOURCE_USERNAME", "1")
-app.config['MQTT_PASSWORD'] = os.getenv("SOURCE_PASSWORD", "1")
+#app.config['MQTT_BROKER_URL'] = os.getenv("SOURCE_BROKER", "127.0.0.1")
+#app.config['MQTT_BROKER_PORT'] = int(os.getenv("SOURCE_PORT", 1883))
+#app.config['MQTT_USERNAME'] = os.getenv("SOURCE_USERNAME", "1")
+#app.config['MQTT_PASSWORD'] = os.getenv("SOURCE_PASSWORD", "1")
+#app.config['MQTT_KEEPALIVE'] = 120
+#app.config['MQTT_TLS_ENABLED'] = False
+
+
+app.config['MQTT_BROKER_URL'] = os.getenv("SOURCE_BROKER", "172.16.10.13")
+app.config['MQTT_BROKER_PORT'] = int(os.getenv("SOURCE_PORT", 30502))
+app.config['MQTT_USERNAME'] = os.getenv("SOURCE_USERNAME", "test")
+app.config['MQTT_PASSWORD'] = os.getenv("SOURCE_PASSWORD", "test")
 app.config['MQTT_KEEPALIVE'] = 120
 app.config['MQTT_TLS_ENABLED'] = False
 
@@ -239,7 +251,7 @@ stream_last_t_rel: Optional[float] = None
 finalizing = False
 finalizing_lock = threading.Lock()
 
-_IDLE_TIMEOUT = 120.0
+_IDLE_TIMEOUT = 300.0
 _idle_timer: Optional[threading.Timer] = None
 _timer_lock = threading.Lock()
 stream_frame_count = 0
@@ -247,14 +259,29 @@ stream_frame_count = 0
 # ---------- 流程阶段管理（部署 -> 决策开始 -> 融合数据） ----------
 _flow_stage_lock = threading.Lock()
 _project_flow_stage: Dict[str, Dict[str, bool]] = {}
+_generate_done_global = False
+_pending_random_deployment: Optional[Dict[str, object]] = None
+
+def _get_message_type(data: dict) -> str:
+    return str(data.get("type") or data.get("Type") or "").strip()
 
 def _extract_project_name(data: dict, default: str = "default") -> str:
-    proj = data.get("projectname")
+    proj = data.get("projectname") or data.get("projectName")
     if not proj:
-        proj = data.get("scene", {}).get("projectname")
+        scene = data.get("scene") or data.get("Scene") or {}
+        proj = scene.get("projectname") or scene.get("projectName")
     if not proj:
         proj = default
-    return proj
+    return str(proj).strip() or default
+
+def _ensure_project_in_config(config: dict, project_name: str) -> None:
+    if not project_name or project_name == "default":
+        return
+    scene = config.setdefault("scene", {})
+    if not scene.get("projectname") and not scene.get("projectName"):
+        scene["projectname"] = project_name
+    if not config.get("projectname") and not config.get("projectName"):
+        config["projectname"] = project_name
 
 def _mark_stage(project: str, stage_key: str, value: bool = True):
     with _flow_stage_lock:
@@ -271,12 +298,66 @@ def _can_start_decision(project: str) -> bool:
         stage = _project_flow_stage.get(project, {})
         return bool(stage.get("generate_done")) and bool(stage.get("regenerate_done"))
 
+def _on_generate_completed() -> None:
+    global _generate_done_global, _pending_random_deployment
+    with _flow_stage_lock:
+        _generate_done_global = True
+    _touch_system_activity()
+    logger.info("流程阶段更新: generate 已完成（未绑定项目，等待 reGenerate 绑定）")
+
+def _on_regenerate_completed(project: str) -> None:
+    global _generate_done_global
+    with _flow_stage_lock:
+        stage = _project_flow_stage.setdefault(project, {
+            "generate_done": False,
+            "regenerate_done": False,
+        })
+        stage["generate_done"] = True
+        stage["regenerate_done"] = True
+        _generate_done_global = False
+    _touch_system_activity()
+    logger.info(
+        "流程阶段更新: project=%s, generate_done=True, regenerate_done=True",
+        project,
+    )
+
+def _store_pending_random_deployment(comm_result: List[dict], radar_result: List[dict]) -> None:
+    global _pending_random_deployment
+    _pending_random_deployment = {
+        "comm": [j.copy() for j in comm_result],
+        "radar": [j.copy() for j in radar_result],
+        "timestamp": time.strftime('%Y-%m-%d %H:%M:%S'),
+    }
+    logger.info(
+        "随机部署结果已缓存在内存（通信 %d / 雷达 %d），不落盘",
+        len(comm_result),
+        len(radar_result),
+    )
+
+def _load_pending_random_as_original(
+    comm_original: List[dict],
+    radar_original: List[dict],
+) -> tuple:
+    global _pending_random_deployment
+    if not _pending_random_deployment:
+        return comm_original, radar_original
+    if not comm_original and _pending_random_deployment.get("comm"):
+        comm_original = [j.copy() for j in _pending_random_deployment["comm"]]
+        logger.info("reGenerate 未携带通信随机位置，使用内存中 generate 结果")
+    if not radar_original and _pending_random_deployment.get("radar"):
+        radar_original = [j.copy() for j in _pending_random_deployment["radar"]]
+        logger.info("reGenerate 未携带雷达随机位置，使用内存中 generate 结果")
+    return comm_original, radar_original
+
 def _clear_stage(project: Optional[str] = None):
+    global _generate_done_global, _pending_random_deployment
     with _flow_stage_lock:
         if project is None:
             _project_flow_stage.clear()
+            _generate_done_global = False
+            _pending_random_deployment = None
             _touch_system_activity()
-            logger.info("已清空所有项目流程阶段")
+            logger.info("已清空所有项目流程阶段与随机部署缓存")
             return
         if project in _project_flow_stage:
             _project_flow_stage.pop(project, None)
@@ -607,9 +688,10 @@ def calc_improvement(orig_val, opt_val):
     return round(diff, 4)
 
 def save_jammer_positions_to_files(config, comm_original, comm_optimized, radar_original, radar_optimized):
-    project_name = config.get("scene", {}).get("projectname", "unknown")
-    if not project_name or project_name == "unknown":
+    project_name = _extract_project_name(config, default="")
+    if not project_name:
         project_name = "default"
+    _ensure_project_in_config(config, project_name)
     project_dir = Path(f"data/{project_name}")
     project_dir.mkdir(parents=True, exist_ok=True)
 
@@ -647,7 +729,180 @@ def save_jammer_positions_to_files(config, comm_original, comm_optimized, radar_
     with open(radar_file, 'w', encoding='utf-8') as f:
         json.dump(radar_data, f, ensure_ascii=False, indent=2)
 
-    logger.info(f"干扰机位置文件已保存至 {project_dir}")
+    logger.info(
+        "干扰机位置已保存至 %s（随机→original*，优化→optimized*；通信 %d/%d，雷达 %d/%d）",
+        project_dir,
+        len(comm_original_show),
+        len(comm_optimized_show),
+        len(radar_original_show),
+        len(radar_optimized_show),
+    )
+
+def _create_scene_projection(center_lon: float, center_lat: float, radius_m: float) -> Transformer:
+    wgs84 = CRS.from_epsg(4326)
+    if radius_m <= 50000:
+        utm_zone = int((center_lon + 180) / 6) + 1
+        hemisphere = "north" if center_lat >= 0 else "south"
+        proj_crs = CRS.from_string(
+            f"+proj=utm +zone={utm_zone} +{hemisphere} +ellps=WGS84 +datum=WGS84 +units=m +no_defs"
+        )
+    elif radius_m <= 150000:
+        proj_crs = CRS.from_string(
+            f"+proj=lcc +lat_1={center_lat - 1} +lat_2={center_lat + 1} "
+            f"+lat_0={center_lat} +lon_0={center_lon} +x_0=0 +y_0=0 "
+            "+ellps=WGS84 +datum=WGS84 +units=m +no_defs"
+        )
+    else:
+        proj_crs = CRS.from_string(
+            f"+proj=merc +lat_0={center_lat} +lon_0={center_lon} "
+            "+k=1.0 +x_0=0 +y_0=0 +ellps=WGS84 +datum=WGS84 +units=m +no_defs"
+        )
+    return Transformer.from_crs(wgs84, proj_crs, always_xy=True)
+
+def _generate_random_positions_in_scene_range(
+    center_lon: float,
+    center_lat: float,
+    center_alt: float,
+    radius_m: float,
+    count: int,
+    range_type: str = "circle",
+) -> List[dict]:
+    if count <= 0:
+        return []
+    range_type_norm = (range_type or "circle").lower()
+    if range_type_norm not in ("circle", "cir", "circular"):
+        logger.warning("区域形状 %s 暂不支持，按 circle 处理", range_type)
+    transformer = _create_scene_projection(center_lon, center_lat, radius_m)
+    center_x, center_y = transformer.transform(center_lon, center_lat)
+    positions = []
+    for _ in range(count):
+        r = radius_m * 0.7 * math.sqrt(random.random())
+        theta = random.random() * 2 * math.pi
+        proj_x = center_x + r * math.cos(theta)
+        proj_y = center_y + r * math.sin(theta)
+        lon, lat = transformer.transform(proj_x, proj_y, direction="INVERSE")
+        positions.append({
+            "longitude": round(lon, 6),
+            "latitude": round(lat, 6),
+            "altitude": center_alt,
+        })
+    return positions
+
+def _parse_jammer_start_jammers(data: dict) -> Tuple[List[dict], List[dict]]:
+    jammers_dict = data.get("Jammers") or data.get("jammers") or {}
+    comm_optimized: List[dict] = []
+    radar_optimized: List[dict] = []
+    for jammer_data in jammers_dict.values():
+        if not isinstance(jammer_data, dict):
+            continue
+        sensor = jammer_data.get("sensorInfo") or {}
+        lon = float(sensor.get("longitude", 0))
+        lat = float(sensor.get("latitude", 0))
+        alt = float(sensor.get("altitude", 0))
+        entry = {
+            "uuid": sensor.get("uuid", ""),
+            "showName": sensor.get("showName", ""),
+            "longitude": round(lon, 6),
+            "latitude": round(lat, 6),
+            "altitude": alt,
+        }
+        if "communicationsJammerInfo" in jammer_data:
+            info = jammer_data["communicationsJammerInfo"]
+            if info.get("jammerType") == 8:
+                comm_optimized.append(entry)
+        elif "radarJammerInfo" in jammer_data:
+            info = jammer_data["radarJammerInfo"]
+            if info.get("jammerType") == 7:
+                radar_optimized.append(entry)
+    return comm_optimized, radar_optimized
+
+def _build_random_from_optimized(
+    optimized_list: List[dict],
+    random_coords: List[dict],
+) -> List[dict]:
+    result = []
+    for opt, coord in zip(optimized_list, random_coords):
+        result.append({
+            "uuid": opt["uuid"],
+            "showName": opt["showName"],
+            "longitude": coord["longitude"],
+            "latitude": coord["latitude"],
+            "altitude": opt.get("altitude", coord.get("altitude", 0.0)),
+        })
+    return result
+
+def run_jammer_start_deployment(data: dict) -> dict:
+    logger.info("执行 jammerStart（跳过 generate/reGenerate，直接准备决策）")
+    scene_raw = data.get("Scene") or data.get("scene") or {}
+    range_info = scene_raw.get("range") or scene_raw.get("Range") or {}
+    project_name = (
+        scene_raw.get("projectName")
+        or scene_raw.get("projectname")
+        or _extract_project_name(data, default="")
+    )
+    if not project_name:
+        project_name = "default"
+
+    center_lon = float(range_info.get("longitude", 0))
+    center_lat = float(range_info.get("latitude", 0))
+    center_alt = float(range_info.get("altitude", 0))
+    radius_m = float(range_info.get("radius", 3000))
+    range_type = range_info.get("rangeType") or range_info.get("rangetype") or "circle"
+
+    comm_optimized, radar_optimized = _parse_jammer_start_jammers(data)
+    logger.info(
+        "jammerStart: project=%s, 通信=%d, 雷达=%d, 中心=(%.6f,%.6f), 半径=%sm, 形状=%s",
+        project_name,
+        len(comm_optimized),
+        len(radar_optimized),
+        center_lat,
+        center_lon,
+        radius_m,
+        range_type,
+    )
+
+    comm_random_coords = _generate_random_positions_in_scene_range(
+        center_lon, center_lat, center_alt, radius_m, len(comm_optimized), range_type
+    )
+    radar_random_coords = _generate_random_positions_in_scene_range(
+        center_lon, center_lat, center_alt, radius_m, len(radar_optimized), range_type
+    )
+    comm_random = _build_random_from_optimized(comm_optimized, comm_random_coords)
+    radar_random = _build_random_from_optimized(radar_optimized, radar_random_coords)
+
+    config = {
+        "projectname": project_name,
+        "scene": {
+            "latitude": str(range_info.get("latitude", center_lat)),
+            "longitude": str(range_info.get("longitude", center_lon)),
+            "altitude": str(range_info.get("altitude", center_alt)),
+            "radius": radius_m,
+            "projectname": project_name,
+        },
+        "guardPoints": data.get("guardPoints") or data.get("GuardPoints") or [],
+    }
+
+    save_jammer_positions_to_files(
+        config=config,
+        comm_original=comm_random,
+        comm_optimized=comm_optimized,
+        radar_original=radar_random,
+        radar_optimized=radar_optimized,
+    )
+    global _pending_random_deployment
+    _pending_random_deployment = None
+
+    return {
+        "Status": True,
+        "Message": "jammerStart 部署完成，可接收融合数据",
+        "Timestamp": time.strftime('%Y-%m-%d %H:%M:%S'),
+        "ProjectName": project_name,
+        "Type": "jammerStart_return",
+        "RadarJammerPositions": radar_optimized,
+        "CommunicationJammerPositions": comm_optimized,
+        "RadarPerformanceMetrics": {},
+        "CommunicationPerformanceMetrics": {},
+    }
 
 # ---------- 随机部署 ----------
 def run_random_deployment(config: dict) -> dict:
@@ -677,7 +932,8 @@ def run_random_deployment(config: dict) -> dict:
             "altitude": 0.0
         })
 
-    save_jammer_positions_to_files(config, comm_result, [], radar_result, [])
+    _store_pending_random_deployment(comm_result, radar_result)
+    logger.info("随机部署仅通过 MQTT 返回，不写入磁盘")
 
     return {
         "Status": True,
@@ -728,19 +984,15 @@ def run_optimization_deployment(config: dict) -> dict:
                 })
                 radar_name_map[uuid] = name
 
-    comm_optimized_positions = comm_original.copy()
-    radar_optimized_positions = radar_original.copy()
+    comm_original, radar_original = _load_pending_random_as_original(comm_original, radar_original)
+    if not comm_original and not radar_original:
+        logger.warning("reGenerate 未解析到随机部署位置（报文 jammer 与内存缓存均为空）")
+
+    comm_optimized_positions = [j.copy() for j in comm_original]
+    radar_optimized_positions = [j.copy() for j in radar_original]
     communication_metrics = {}
     radar_metrics = {}
     opt_success = False
-
-    save_jammer_positions_to_files(
-        config=config,
-        comm_original=comm_original,
-        comm_optimized=comm_optimized_positions,
-        radar_original=radar_original,
-        radar_optimized=radar_optimized_positions
-    )
 
     try:
         logger.info("开始通信干扰机优化...")
@@ -839,16 +1091,20 @@ def run_optimization_deployment(config: dict) -> dict:
     except Exception as e:
         logger.error(f"优化过程中发生异常: {e}", exc_info=True)
         logger.warning("将使用原始位置作为优化结果")
-        comm_optimized_positions = comm_original.copy()
-        radar_optimized_positions = radar_original.copy()
+        comm_optimized_positions = [j.copy() for j in comm_original]
+        radar_optimized_positions = [j.copy() for j in radar_original]
 
+    project_name = _extract_project_name(config, default="")
+    _ensure_project_in_config(config, project_name)
     save_jammer_positions_to_files(
         config=config,
         comm_original=comm_original,
         comm_optimized=comm_optimized_positions,
         radar_original=radar_original,
-        radar_optimized=radar_optimized_positions
+        radar_optimized=radar_optimized_positions,
     )
+    global _pending_random_deployment
+    _pending_random_deployment = None
 
     if opt_success and (comm_optimized_positions != comm_original or radar_optimized_positions != radar_original):
         msg = "优化部署成功"
@@ -898,7 +1154,7 @@ def on_message(client, userdata, message):
                 logger.info(
                     "MQTT消息摘要: topic=%s type=%s project=%s sensor_type=%s payload_size=%s",
                     message.topic,
-                    item.get("type"),
+                    _get_message_type(item),
                     _extract_project_name(item, default=""),
                     item.get("sensor_type"),
                     len(message.payload)
@@ -908,7 +1164,7 @@ def on_message(client, userdata, message):
             logger.info(
                 "MQTT消息摘要: topic=%s type=%s project=%s sensor_type=%s payload_size=%s",
                 message.topic,
-                raw_data.get("type"),
+                _get_message_type(raw_data),
                 _extract_project_name(raw_data, default=""),
                 raw_data.get("sensor_type"),
                 len(message.payload)
@@ -925,7 +1181,7 @@ def _process_single_message(topic, data):
     global finalizing
 
     # 部署消息处理
-    msg_type = data.get("type")
+    msg_type = _get_message_type(data)
     topic_is_vi_decision = topic == "vi_decision" or topic.startswith("vi_decision/")
     topic_is_pg_finish = topic == "pg_data_processor_finish" or topic.startswith("pg_data_processor_finish/")
 
@@ -933,18 +1189,22 @@ def _process_single_message(topic, data):
         if msg_type == "generate":
             result = run_random_deployment(data)
             send_to_target(result)
-            proj = _extract_project_name(data)
-            _mark_stage(proj, "generate_done", True)
+            _on_generate_completed()
             return
         elif msg_type == "reGenerate":
+            proj = _extract_project_name(data)
             result = run_optimization_deployment(data)
             send_to_target(result)
-            proj = _extract_project_name(data)
-            _mark_stage(proj, "regenerate_done", True)
+            _on_regenerate_completed(proj)
+            return
+        elif msg_type == "jammerStart":
+            result = run_jammer_start_deployment(data)
+            send_to_target(result)
+            _on_regenerate_completed(result.get("ProjectName") or _extract_project_name(data))
             return
 
     # 手动调试触发最终化
-    if data.get("type") == "debug_finalize":
+    if msg_type == "debug_finalize":
         logger.info("收到调试指令，手动触发最终化")
         _finalize_stream(idle_reason="debug_finalize")
         return
@@ -963,10 +1223,15 @@ def _process_single_message(topic, data):
 
         proj = _extract_project_name(data)
         if not _can_start_decision(proj):
-            logger.warning(
-                f"融合数据到达但部署阶段未完成，忽略。project={proj}，"
-                f"需先完成 generate 与 reGenerate"
-            )
+            with _flow_stage_lock:
+                stage = _project_flow_stage.get(proj, {})
+                logger.warning(
+                    "融合数据到达但部署阶段未完成，忽略。project=%s，"
+                    "generate_done=%s，regenerate_done=%s（需先完成 generate+reGenerate 或 jammerStart）",
+                    proj,
+                    stage.get("generate_done", False),
+                    stage.get("regenerate_done", False),
+                )
             return
         logger.debug(f"处理 simData，项目: {proj}")
 
@@ -1034,7 +1299,7 @@ def _process_single_message(topic, data):
         _reset_idle_timer()
         return
 
-    if data.get("type") == "simStop":
+    if msg_type == "simStop":
         proj = _extract_project_name(data, default="")
         with stream_lock:
             if not stream_active:
