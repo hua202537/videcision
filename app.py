@@ -1,6 +1,7 @@
 import os
 import json
 import time
+import hashlib
 import math
 import random
 import logging
@@ -8,15 +9,23 @@ import builtins
 import sys
 import io
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Union
 
 from pyproj import Transformer, CRS
 from logging.handlers import RotatingFileHandler
 from queue import Queue
 
-from flask import Flask, jsonify, request, g
+from flask import Flask, jsonify, request, g, render_template
 from flask_mqtt import Mqtt
 from flask_cors import CORS
+
+from config_manager import (
+    load_config,
+    save_config,
+    validate_config,
+    public_config,
+    apply_config_to_environ,
+)
 import threading
 import concurrent.futures
 import matplotlib
@@ -36,6 +45,19 @@ from radar_youhua_deployment import RadarJammerOptimization as RadarOptimization
 # 决策模块（流式版本）
 import communication_decision
 import radar_decision
+from field_utils import (
+    DEFAULT_BATCH,
+    DEFAULT_PROJECT,
+    ci_get,
+    clear_project_batch_registry,
+    ensure_scene_metadata,
+    extract_batch_name,
+    extract_project_name,
+    get_batch_for_project,
+    normalize_message_type,
+    sync_project_batch,
+)
+from shujuku import query_decision_result_project_batch_list, query_decision_result_simulation
 
 # ---------- 日志重定向 ----------
 _original_print = builtins.print
@@ -156,24 +178,26 @@ def _handle_unexpected_http_error(e):
         "message": f"服务内部异常: {str(e)}"
     }), 500
 
+# ---------- 运行时配置（.env 持久化，支持网页修改） ----------
+_runtime_config = load_config()
+apply_config_to_environ(_runtime_config)
+
+
+def _apply_mqtt_config_from_env():
+    app.config['MQTT_BROKER_URL'] = os.getenv("SOURCE_BROKER", "172.16.10.13")
+    app.config['MQTT_BROKER_PORT'] = int(os.getenv("SOURCE_PORT", 30502))
+    app.config['MQTT_USERNAME'] = os.getenv("SOURCE_USERNAME", "test1")
+    app.config['MQTT_PASSWORD'] = os.getenv("SOURCE_PASSWORD", "test1")
+    app.config['MQTT_KEEPALIVE'] = 120
+    app.config['MQTT_TLS_ENABLED'] = False
+
+
 # ---------- MQTT 配置 ----------
-#app.config['MQTT_BROKER_URL'] = os.getenv("SOURCE_BROKER", "127.0.0.1")
-#app.config['MQTT_BROKER_PORT'] = int(os.getenv("SOURCE_PORT", 1883))
-#app.config['MQTT_USERNAME'] = os.getenv("SOURCE_USERNAME", "1")
-#app.config['MQTT_PASSWORD'] = os.getenv("SOURCE_PASSWORD", "1")
-#app.config['MQTT_KEEPALIVE'] = 120
-#app.config['MQTT_TLS_ENABLED'] = False
+_apply_mqtt_config_from_env()
+app.config['MQTT_CLIENT_ID'] = os.getenv('MQTT_CLIENT_ID', f"decision_{os.getpid()}")
 
-
-app.config['MQTT_BROKER_URL'] = os.getenv("SOURCE_BROKER", "172.16.10.13")
-app.config['MQTT_BROKER_PORT'] = int(os.getenv("SOURCE_PORT", 30502))
-app.config['MQTT_USERNAME'] = os.getenv("SOURCE_USERNAME", "test")
-app.config['MQTT_PASSWORD'] = os.getenv("SOURCE_PASSWORD", "test")
-app.config['MQTT_KEEPALIVE'] = 120
-app.config['MQTT_TLS_ENABLED'] = False
-
+# 注意：Mqtt(app) 构造函数内已调用 init_app，切勿再次 init_app，否则会重复 connect/loop_start
 mqtt_receiver = Mqtt(app)
-mqtt_receiver.init_app(app)
 
 # ---------- 订阅主题 (修改：仅订阅指令与目标数据，步数据统一发到 vi_decision_res，服务端不再订阅以避免自消费) ----------
 SUBSCRIBE_TOPICS = [
@@ -186,6 +210,159 @@ for topic in SUBSCRIBE_TOPICS:
 
 _mqtt_connected = False
 _mqtt_lock = threading.Lock()
+_mqtt_dedup_lock = threading.Lock()
+_mqtt_dedup_cache: Dict[str, Union[float, str]] = {}
+_MQTT_DEDUP_TTL = 2.0
+_MQTT_CLAIM_PROCESSING = "__processing__"
+_mqtt_dispatch_thread_id: Optional[int] = None
+
+
+def _mqtt_loop_thread_names() -> List[str]:
+    return [
+        t.name for t in threading.enumerate()
+        if t.name.startswith("paho-mqtt") or t.name == "Thread-1"
+    ]
+
+
+def _stop_mqtt_network_loop(client) -> None:
+    """安全停止 paho 网络线程，避免 reconnect 后存在多个 loop 线程。"""
+    try:
+        client.loop_stop()
+    except Exception as e:
+        logger.debug(f"MQTT loop_stop: {e}")
+    thread = getattr(client, "_thread", None)
+    if thread is not None and thread.is_alive():
+        try:
+            thread.join(timeout=3.0)
+        except Exception as e:
+            logger.debug(f"MQTT loop thread join: {e}")
+    client._thread = None
+
+
+def _start_mqtt_network_loop(client) -> None:
+    """仅启动一个 MQTT 网络循环线程。"""
+    if getattr(client, "_thread", None) is not None:
+        logger.warning("MQTT loop 线程仍存在，先停止再启动")
+        _stop_mqtt_network_loop(client)
+        time.sleep(0.05)
+    rc = client.loop_start()
+    if rc not in (None, 0):
+        logger.error("MQTT loop_start 失败，返回码=%s", rc)
+
+
+def _ensure_single_mqtt_network_loop() -> None:
+    """flask-mqtt 初始化后强制只保留一个 loop，消除 Thread-1 与 paho 双线程重复收消息。"""
+    global _mqtt_dispatch_thread_id
+    client = mqtt_receiver.client
+    before = _mqtt_loop_thread_names()
+    if before:
+        logger.warning("检测到多个 MQTT 网络线程，正在重置: %s", before)
+    _stop_mqtt_network_loop(client)
+    time.sleep(0.1)
+    _start_mqtt_network_loop(client)
+    _mqtt_dispatch_thread_id = None
+    after = _mqtt_loop_thread_names()
+    logger.info("MQTT 网络循环已重置，当前线程: %s", after or "(无)")
+
+
+_ensure_single_mqtt_network_loop()
+
+
+def _mqtt_dedup_key(topic: str, payload: bytes) -> str:
+    return f"{topic}:{hashlib.md5(payload).hexdigest()}"
+
+
+def _try_claim_mqtt_message(topic: str, payload: bytes) -> Optional[str]:
+    """抢占处理权；返回 key 表示本线程应处理，返回 None 表示跳过重复消息。"""
+    key = _mqtt_dedup_key(topic, payload)
+    now = time.time()
+    with _mqtt_dedup_lock:
+        entry = _mqtt_dedup_cache.get(key)
+        if entry == _MQTT_CLAIM_PROCESSING:
+            return None
+        if isinstance(entry, float) and now - entry < _MQTT_DEDUP_TTL:
+            return None
+        _mqtt_dedup_cache[key] = _MQTT_CLAIM_PROCESSING
+        if len(_mqtt_dedup_cache) > 2000:
+            cutoff = now - _MQTT_DEDUP_TTL
+            expired = [k for k, ts in _mqtt_dedup_cache.items() if isinstance(ts, float) and ts < cutoff]
+            for k in expired:
+                _mqtt_dedup_cache.pop(k, None)
+    return key
+
+
+def _release_mqtt_claim(key: Optional[str]) -> None:
+    if not key:
+        return
+    with _mqtt_dedup_lock:
+        _mqtt_dedup_cache[key] = time.time()
+
+
+def _bind_mqtt_dispatch_thread() -> bool:
+    """仅允许 client._thread 对应的网络线程向业务层派发消息。"""
+    global _mqtt_dispatch_thread_id
+    tid = threading.get_ident()
+    name = threading.current_thread().name
+    loop_thread = getattr(mqtt_receiver.client, "_thread", None)
+    if loop_thread is not None and threading.current_thread() is not loop_thread:
+        logger.info(
+            "跳过非主 MQTT loop 线程 %s（主循环=%s）",
+            name,
+            loop_thread.name,
+        )
+        return False
+    if _mqtt_dispatch_thread_id is None:
+        _mqtt_dispatch_thread_id = tid
+        logger.info("MQTT 消息派发绑定线程: %s", name)
+        return True
+    if tid == _mqtt_dispatch_thread_id:
+        return True
+    logger.info("跳过非绑定 MQTT 线程的重复回调: %s (绑定线程 id=%s)", name, _mqtt_dispatch_thread_id)
+    return False
+
+
+def reconnect_mqtt() -> bool:
+    """断开并按当前环境变量中的 MQTT 配置重新连接。"""
+    global _mqtt_connected
+    _apply_mqtt_config_from_env()
+    broker = app.config['MQTT_BROKER_URL']
+    port = int(app.config['MQTT_BROKER_PORT'])
+    username = app.config.get('MQTT_USERNAME') or ''
+    password = app.config.get('MQTT_PASSWORD') or ''
+    keepalive = int(app.config.get('MQTT_KEEPALIVE', 120))
+
+    with _mqtt_lock:
+        _mqtt_connected = False
+        client = mqtt_receiver.client
+        _stop_mqtt_network_loop(client)
+        try:
+            client.disconnect()
+        except Exception as e:
+            logger.debug(f"MQTT disconnect: {e}")
+        time.sleep(0.3)
+
+        if username:
+            client.username_pw_set(username, password)
+        else:
+            client.username_pw_set(None, None)
+        try:
+            global _mqtt_dispatch_thread_id
+            _mqtt_dispatch_thread_id = None
+            client.connect(broker, port, keepalive=keepalive)
+            _start_mqtt_network_loop(client)
+            for topic in SUBSCRIBE_TOPICS:
+                client.subscribe(topic)
+            logger.info(
+                "MQTT 已重连至 %s:%s（client_id=%s, pid=%s）",
+                broker,
+                port,
+                app.config.get('MQTT_CLIENT_ID'),
+                os.getpid(),
+            )
+            return True
+        except Exception as e:
+            logger.error(f"MQTT 重连失败: {e}", exc_info=True)
+            return False
 
 # ---------- MQTT 发送队列 ----------
 mqtt_send_queue = Queue()
@@ -240,6 +417,7 @@ threading.Thread(target=mqtt_sender_worker, daemon=True, name="MQTTSender").star
 # ---------- 流式状态管理 ----------
 stream_active = False
 stream_project_name: Optional[str] = None
+stream_batch_name: Optional[str] = None
 stream_comm_sim_rand: Optional[communication_decision.CommunicationJammerSimulation] = None
 stream_comm_sim_opt: Optional[communication_decision.CommunicationJammerSimulation] = None
 stream_radar_sim_rand: Optional[radar_decision.RadarJammerSimulation] = None
@@ -250,6 +428,7 @@ stream_last_t_rel: Optional[float] = None
 
 finalizing = False
 finalizing_lock = threading.Lock()
+_mqtt_dispatch_lock = threading.Lock()
 
 _IDLE_TIMEOUT = 300.0
 _idle_timer: Optional[threading.Timer] = None
@@ -263,25 +442,24 @@ _generate_done_global = False
 _pending_random_deployment: Optional[Dict[str, object]] = None
 
 def _get_message_type(data: dict) -> str:
-    return str(data.get("type") or data.get("Type") or "").strip()
+    raw = ci_get(data, "type", "Type", default="")
+    return normalize_message_type(raw)
 
-def _extract_project_name(data: dict, default: str = "default") -> str:
-    proj = data.get("projectname") or data.get("projectName")
-    if not proj:
-        scene = data.get("scene") or data.get("Scene") or {}
-        proj = scene.get("projectname") or scene.get("projectName")
-    if not proj:
-        proj = default
-    return str(proj).strip() or default
+_DEPLOYMENT_MSG_TYPES = frozenset({"generate", "reGenerate", "jammerStart"})
 
-def _ensure_project_in_config(config: dict, project_name: str) -> None:
-    if not project_name or project_name == "default":
-        return
-    scene = config.setdefault("scene", {})
-    if not scene.get("projectname") and not scene.get("projectName"):
-        scene["projectname"] = project_name
-    if not config.get("projectname") and not config.get("projectName"):
-        config["projectname"] = project_name
+def _is_deployment_message(msg_type: str) -> bool:
+    return msg_type in _DEPLOYMENT_MSG_TYPES
+
+def _log_flow_stage_snapshot(context: str) -> None:
+    with _flow_stage_lock:
+        snapshot = dict(_project_flow_stage)
+    logger.info("流程阶段快照 [%s]: %s", context, snapshot or "(空)")
+
+def _extract_project_name(data: dict, default: str = DEFAULT_PROJECT) -> str:
+    return extract_project_name(data, default)
+
+def _ensure_project_in_config(config: dict, project_name: str, batch_name: str = DEFAULT_BATCH) -> None:
+    ensure_scene_metadata(config, project_name or DEFAULT_PROJECT, batch_name or DEFAULT_BATCH)
 
 def _mark_stage(project: str, stage_key: str, value: bool = True):
     with _flow_stage_lock:
@@ -351,18 +529,79 @@ def _load_pending_random_as_original(
 
 def _clear_stage(project: Optional[str] = None):
     global _generate_done_global, _pending_random_deployment
+    clear_project_batch_registry(project)
     with _flow_stage_lock:
         if project is None:
             _project_flow_stage.clear()
             _generate_done_global = False
             _pending_random_deployment = None
             _touch_system_activity()
-            logger.info("已清空所有项目流程阶段与随机部署缓存")
+            logger.info("已清空所有项目流程阶段、批次记忆与随机部署缓存")
             return
         if project in _project_flow_stage:
             _project_flow_stage.pop(project, None)
             _touch_system_activity()
             logger.info(f"已清空项目流程阶段: {project}")
+
+def _end_fusion_stream(data: dict, *, topic: str = ""):
+    """收到 fusion_end（pg_data_processor_finish 主题）时立即结束融合流。"""
+    topic_is_pg_finish = (
+        topic == "pg_data_processor_finish"
+        or topic.startswith("pg_data_processor_finish/")
+    )
+    if not topic_is_pg_finish:
+        logger.warning(
+            "收到 fusion_end 但 topic 非 pg_data_processor_finish，忽略。topic=%s",
+            topic,
+        )
+        return
+
+    # 先取消空闲定时器，避免 fusion_end 后仍等待 300 秒超时
+    _cancel_idle_timer()
+
+    proj = _extract_project_name(data, default="")
+    if not proj:
+        proj = str(ci_get(data, "simID", "simid", default="") or "").strip()
+
+    with stream_lock:
+        active = stream_active
+        has_sims = any(
+            sim is not None
+            for sim in (
+                stream_comm_sim_rand,
+                stream_comm_sim_opt,
+                stream_radar_sim_rand,
+                stream_radar_sim_opt,
+            )
+        )
+        if not proj:
+            proj = stream_project_name or ""
+
+    with finalizing_lock:
+        if finalizing:
+            logger.warning("收到 fusion_end 但最终化已在进行，已取消空闲定时器")
+            return
+
+    if not active and not has_sims:
+        with _status_lock:
+            status = _system_status
+        logger.warning(
+            "收到 fusion_end 但无活跃流/模拟器（stream_active=%s, status=%s），"
+            "已取消空闲定时器，跳过最终化",
+            active,
+            status,
+        )
+        return
+
+    logger.info(
+        "收到 fusion_end，立即触发最终化（stream_active=%s, has_sims=%s, project=%s）",
+        active,
+        has_sims,
+        proj or "(未知)",
+    )
+    _finalize_stream(idle_reason="normal_finished")
+    if proj:
+        _clear_stage(proj)
 
 # ---------- 系统状态管理 ----------
 _system_status = "idle"  # idle / running / error
@@ -421,7 +660,7 @@ def _cancel_idle_timer():
             _idle_timer = None
 
 def _reset_stream_state(reason: str = "stream_reset", update_status: bool = True):
-    global stream_active, stream_project_name
+    global stream_active, stream_project_name, stream_batch_name
     global stream_comm_sim_rand, stream_comm_sim_opt
     global stream_radar_sim_rand, stream_radar_sim_opt
     global stream_t0_abs, stream_last_t_rel, stream_frame_count
@@ -429,6 +668,7 @@ def _reset_stream_state(reason: str = "stream_reset", update_status: bool = True
         logger.debug("重置流式状态")
         stream_active = False
         stream_project_name = None
+        stream_batch_name = None
         stream_comm_sim_rand = None
         stream_comm_sim_opt = None
         stream_radar_sim_rand = None
@@ -509,24 +749,36 @@ def _finalize_stream(idle_reason: str = "normal_finished"):
 
     finalize_success = False
     try:
-        global stream_active, stream_project_name
+        global stream_active, stream_project_name, stream_batch_name
         global stream_comm_sim_rand, stream_comm_sim_opt
         global stream_radar_sim_rand, stream_radar_sim_opt
         global stream_last_t_rel
 
         logger.info("========== 开始最终化数据流 ==========")
         proj = None
+        batch = DEFAULT_BATCH
         with stream_lock:
-            if not stream_active:
-                logger.warning("流式状态未激活，跳过最终化")
+            has_sims = any(
+                sim is not None
+                for sim in (
+                    stream_comm_sim_rand,
+                    stream_comm_sim_opt,
+                    stream_radar_sim_rand,
+                    stream_radar_sim_opt,
+                )
+            )
+            if not stream_active and not has_sims:
+                logger.warning("流式状态未激活且无模拟器，跳过最终化")
                 return
             comm_rand = stream_comm_sim_rand
             comm_opt = stream_comm_sim_opt
             radar_rand = stream_radar_sim_rand
             radar_opt = stream_radar_sim_opt
             proj = stream_project_name
+            batch = stream_batch_name or get_batch_for_project(proj or DEFAULT_PROJECT)
             stream_active = False
             stream_project_name = None
+            stream_batch_name = None
             stream_comm_sim_rand = None
             stream_comm_sim_opt = None
             stream_radar_sim_rand = None
@@ -535,8 +787,15 @@ def _finalize_stream(idle_reason: str = "normal_finished"):
             stream_last_t_rel = None
         _cancel_idle_timer()
 
-        if None in (comm_rand, comm_opt, radar_rand, radar_opt):
-            logger.warning("部分流式模拟器未初始化，无法最终化")
+        active_sims = [
+            (comm_rand, "通信随机"),
+            (comm_opt, "通信优化"),
+            (radar_rand, "雷达随机"),
+            (radar_opt, "雷达优化"),
+        ]
+        sims_to_finalize = [(sim, name) for sim, name in active_sims if sim is not None]
+        if not sims_to_finalize:
+            logger.warning("没有可最终化的流式模拟器，跳过最终化")
             return
 
         def get_metrics(sim, name):
@@ -549,16 +808,20 @@ def _finalize_stream(idle_reason: str = "normal_finished"):
                 logger.error(f"{name} 决策最终化失败: {e}", exc_info=True)
                 return None
 
-        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
-            future_comm_rand = executor.submit(get_metrics, comm_rand, "通信随机")
-            future_comm_opt = executor.submit(get_metrics, comm_opt, "通信优化")
-            future_radar_rand = executor.submit(get_metrics, radar_rand, "雷达随机")
-            future_radar_opt = executor.submit(get_metrics, radar_opt, "雷达优化")
+        metrics_by_name: Dict[str, Optional[dict]] = {}
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max(len(sims_to_finalize), 1)) as executor:
+            future_map = {
+                executor.submit(get_metrics, sim, name): name
+                for sim, name in sims_to_finalize
+            }
+            for future in concurrent.futures.as_completed(future_map):
+                name = future_map[future]
+                metrics_by_name[name] = future.result(timeout=30)
 
-            comm_rand_metrics = future_comm_rand.result(timeout=30)
-            comm_opt_metrics = future_comm_opt.result(timeout=30)
-            radar_rand_metrics = future_radar_rand.result(timeout=30)
-            radar_opt_metrics = future_radar_opt.result(timeout=30)
+        comm_rand_metrics = metrics_by_name.get("通信随机")
+        comm_opt_metrics = metrics_by_name.get("通信优化")
+        radar_rand_metrics = metrics_by_name.get("雷达随机")
+        radar_opt_metrics = metrics_by_name.get("雷达优化")
 
         if last_t_rel is not None:
             logger.info(f"数据流实际处理的最大相对时间: {last_t_rel:.2f}s")
@@ -651,12 +914,14 @@ def _finalize_stream(idle_reason: str = "normal_finished"):
             except Exception as e:
                 logger.error(f"保存雷达对比文件失败: {e}")
 
+        proj_out = proj or DEFAULT_PROJECT
+        batch_out = batch or DEFAULT_BATCH
         result = {
             "Status": True,
             "Message": "应对决策处理完成",
             "Timestamp": time.strftime('%Y-%m-%d %H:%M:%S'),
-            "ProjectName": proj or "default",
-            "Type": "fusion_result",
+            "projectname": proj_out,
+            "batchname": batch_out,
             "type": "decision_result",
             "CommunicationMetrics": comm_metrics_full,
             "RadarMetrics": radar_metrics_full,
@@ -688,10 +953,8 @@ def calc_improvement(orig_val, opt_val):
     return round(diff, 4)
 
 def save_jammer_positions_to_files(config, comm_original, comm_optimized, radar_original, radar_optimized):
-    project_name = _extract_project_name(config, default="")
-    if not project_name:
-        project_name = "default"
-    _ensure_project_in_config(config, project_name)
+    project_name, batch_name = sync_project_batch(config)
+    ensure_scene_metadata(config, project_name, batch_name)
     project_dir = Path(f"data/{project_name}")
     project_dir.mkdir(parents=True, exist_ok=True)
 
@@ -730,13 +993,52 @@ def save_jammer_positions_to_files(config, comm_original, comm_optimized, radar_
         json.dump(radar_data, f, ensure_ascii=False, indent=2)
 
     logger.info(
-        "干扰机位置已保存至 %s（随机→original*，优化→optimized*；通信 %d/%d，雷达 %d/%d）",
+        "干扰机位置已保存至 %s projectname=%s batchname=%s（随机→original*，优化→optimized*；通信 %d/%d，雷达 %d/%d）",
         project_dir,
+        project_name,
+        batch_name,
         len(comm_original_show),
         len(comm_optimized_show),
         len(radar_original_show),
         len(radar_optimized_show),
     )
+
+def _jammer_entries_from_json(data: dict, *keys: str) -> List[dict]:
+    for key in keys:
+        entries = data.get(key)
+        if isinstance(entries, list) and entries:
+            return entries
+    return []
+
+def _project_has_jammer_type(project_name: str, jammer_type: str) -> bool:
+    project_dir = Path(f"data/{project_name}")
+    if jammer_type == "comm":
+        path = project_dir / "communication_jammer_positions.json"
+        original_keys = ("originalJammers", "originaljammers")
+        optimized_keys = ("optimizedJammers", "optimizedjammers")
+    elif jammer_type == "radar":
+        path = project_dir / "radar_jammer_positions.json"
+        original_keys = ("originaljammers", "originalJammers")
+        optimized_keys = ("optimizedjammers", "optimizedJammers")
+    else:
+        return False
+    if not path.exists():
+        return False
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, json.JSONDecodeError) as e:
+        logger.warning("读取干扰机配置失败 path=%s error=%s", path, e)
+        return False
+    return bool(
+        _jammer_entries_from_json(data, *original_keys)
+        or _jammer_entries_from_json(data, *optimized_keys)
+    )
+
+def _get_project_jammer_availability(project_name: str) -> Tuple[bool, bool]:
+    has_comm = _project_has_jammer_type(project_name, "comm")
+    has_radar = _project_has_jammer_type(project_name, "radar")
+    return has_comm, has_radar
 
 def _create_scene_projection(center_lon: float, center_lat: float, radius_m: float) -> Transformer:
     wgs84 = CRS.from_epsg(4326)
@@ -833,21 +1135,19 @@ def _build_random_from_optimized(
 
 def run_jammer_start_deployment(data: dict) -> dict:
     logger.info("执行 jammerStart（跳过 generate/reGenerate，直接准备决策）")
-    scene_raw = data.get("Scene") or data.get("scene") or {}
-    range_info = scene_raw.get("range") or scene_raw.get("Range") or {}
-    project_name = (
-        scene_raw.get("projectName")
-        or scene_raw.get("projectname")
-        or _extract_project_name(data, default="")
-    )
-    if not project_name:
-        project_name = "default"
+    project_name, batch_name = sync_project_batch(data)
+    scene_raw = ci_get(data, "scene", "Scene") or {}
+    if not isinstance(scene_raw, dict):
+        scene_raw = {}
+    range_info = ci_get(scene_raw, "range", "Range") or {}
+    if not isinstance(range_info, dict):
+        range_info = {}
 
-    center_lon = float(range_info.get("longitude", 0))
-    center_lat = float(range_info.get("latitude", 0))
-    center_alt = float(range_info.get("altitude", 0))
-    radius_m = float(range_info.get("radius", 3000))
-    range_type = range_info.get("rangeType") or range_info.get("rangetype") or "circle"
+    center_lon = float(ci_get(range_info, "longitude", default=0) or 0)
+    center_lat = float(ci_get(range_info, "latitude", default=0) or 0)
+    center_alt = float(ci_get(range_info, "altitude", default=0) or 0)
+    radius_m = float(ci_get(range_info, "radius", default=3000) or 3000)
+    range_type = ci_get(range_info, "rangeType", "rangetype", default="circle") or "circle"
 
     comm_optimized, radar_optimized = _parse_jammer_start_jammers(data)
     logger.info(
@@ -872,14 +1172,16 @@ def run_jammer_start_deployment(data: dict) -> dict:
 
     config = {
         "projectname": project_name,
+        "batchname": batch_name,
         "scene": {
-            "latitude": str(range_info.get("latitude", center_lat)),
-            "longitude": str(range_info.get("longitude", center_lon)),
-            "altitude": str(range_info.get("altitude", center_alt)),
+            "latitude": str(ci_get(range_info, "latitude", default=center_lat)),
+            "longitude": str(ci_get(range_info, "longitude", default=center_lon)),
+            "altitude": str(ci_get(range_info, "altitude", default=center_alt)),
             "radius": radius_m,
             "projectname": project_name,
+            "batchname": batch_name,
         },
-        "guardPoints": data.get("guardPoints") or data.get("GuardPoints") or [],
+        "guardPoints": ci_get(data, "guardPoints", "GuardPoints") or [],
     }
 
     save_jammer_positions_to_files(
@@ -891,12 +1193,14 @@ def run_jammer_start_deployment(data: dict) -> dict:
     )
     global _pending_random_deployment
     _pending_random_deployment = None
+    _on_regenerate_completed(project_name)
 
     return {
         "Status": True,
         "Message": "jammerStart 部署完成，可接收融合数据",
         "Timestamp": time.strftime('%Y-%m-%d %H:%M:%S'),
-        "ProjectName": project_name,
+        "projectname": project_name,
+        "batchname": batch_name,
         "Type": "jammerStart_return",
         "RadarJammerPositions": radar_optimized,
         "CommunicationJammerPositions": comm_optimized,
@@ -907,6 +1211,8 @@ def run_jammer_start_deployment(data: dict) -> dict:
 # ---------- 随机部署 ----------
 def run_random_deployment(config: dict) -> dict:
     logger.info("执行随机部署 (generate)")
+    project_name, batch_name = sync_project_batch(config)
+    ensure_scene_metadata(config, project_name, batch_name)
     comm_deployer = CommRandomDeployment(config)
     comm_positions, _ = comm_deployer.generate_deployment()
     comm_result = []
@@ -943,13 +1249,16 @@ def run_random_deployment(config: dict) -> dict:
         "CommunicationJammerPositions": comm_result,
         "RadarPerformanceMetrics": {},
         "CommunicationPerformanceMetrics": {},
-        "ProjectName": config.get("scene", {}).get("projectname", ""),
+        "projectname": project_name,
+        "batchname": batch_name,
         "Type": "deployment_random_return"
     }
 
 # ---------- 优化部署 ----------
 def run_optimization_deployment(config: dict) -> dict:
     logger.info("执行优化部署 (reGenerate)")
+    project_name, batch_name = sync_project_batch(config)
+    ensure_scene_metadata(config, project_name, batch_name)
 
     comm_original = []
     radar_original = []
@@ -987,6 +1296,20 @@ def run_optimization_deployment(config: dict) -> dict:
     comm_original, radar_original = _load_pending_random_as_original(comm_original, radar_original)
     if not comm_original and not radar_original:
         logger.warning("reGenerate 未解析到随机部署位置（报文 jammer 与内存缓存均为空）")
+
+    if comm_original or radar_original:
+        save_jammer_positions_to_files(
+            config=config,
+            comm_original=comm_original,
+            comm_optimized=[j.copy() for j in comm_original],
+            radar_original=radar_original,
+            radar_optimized=[j.copy() for j in radar_original],
+        )
+        _on_regenerate_completed(project_name)
+        logger.info(
+            "reGenerate 原始位置已落盘，部署阶段已就绪 project=%s（优化计算继续进行中）",
+            project_name,
+        )
 
     comm_optimized_positions = [j.copy() for j in comm_original]
     radar_optimized_positions = [j.copy() for j in radar_original]
@@ -1094,8 +1417,6 @@ def run_optimization_deployment(config: dict) -> dict:
         comm_optimized_positions = [j.copy() for j in comm_original]
         radar_optimized_positions = [j.copy() for j in radar_original]
 
-    project_name = _extract_project_name(config, default="")
-    _ensure_project_in_config(config, project_name)
     save_jammer_positions_to_files(
         config=config,
         comm_original=comm_original,
@@ -1119,7 +1440,8 @@ def run_optimization_deployment(config: dict) -> dict:
         "CommunicationJammerPositions": comm_optimized_positions,
         "RadarPerformanceMetrics": radar_metrics if radar_metrics else {},
         "CommunicationPerformanceMetrics": communication_metrics if communication_metrics else {},
-        "ProjectName": config.get("scene", {}).get("projectname", ""),
+        "projectname": project_name,
+        "batchname": batch_name,
         "Type": "deployment_return"
     }
 
@@ -1130,7 +1452,17 @@ def on_connect(client, userdata, flags, rc):
     if rc == 0:
         with _mqtt_lock:
             if not _mqtt_connected:
-                logger.info("MQTT 连接成功")
+                loop_threads = _mqtt_loop_thread_names()
+                if len(loop_threads) > 1:
+                    logger.warning("MQTT 连接时发现多个 loop 线程，执行重置: %s", loop_threads)
+                    _ensure_single_mqtt_network_loop()
+                    loop_threads = _mqtt_loop_thread_names()
+                logger.info(
+                    "MQTT 连接成功（client_id=%s, pid=%s, loop_threads=%s）",
+                    app.config.get('MQTT_CLIENT_ID'),
+                    os.getpid(),
+                    loop_threads or "(无)",
+                )
                 _mqtt_connected = True
     else:
         logger.error(f"连接失败，返回码: {rc}")
@@ -1144,7 +1476,20 @@ def on_disconnect():
 
 @mqtt_receiver.on_message()
 def on_message(client, userdata, message):
+    claim_key = _try_claim_mqtt_message(message.topic, message.payload)
+    if claim_key is None:
+        logger.info(
+            "跳过重复 MQTT 消息 topic=%s size=%s thread=%s",
+            message.topic,
+            len(message.payload),
+            threading.current_thread().name,
+        )
+        return
+
     try:
+        if not _bind_mqtt_dispatch_thread():
+            return
+
         payload = message.payload.decode()
         raw_data = json.loads(payload)
         logger.info(f"收到消息 [{message.topic}]: {payload[:300]}...")
@@ -1156,7 +1501,7 @@ def on_message(client, userdata, message):
                     message.topic,
                     _get_message_type(item),
                     _extract_project_name(item, default=""),
-                    item.get("sensor_type"),
+                    ci_get(item, "sensor_type", "Sensor_Type"),
                     len(message.payload)
                 )
                 _process_single_message(message.topic, item)
@@ -1166,41 +1511,80 @@ def on_message(client, userdata, message):
                 message.topic,
                 _get_message_type(raw_data),
                 _extract_project_name(raw_data, default=""),
-                raw_data.get("sensor_type"),
+                ci_get(raw_data, "sensor_type", "Sensor_Type"),
                 len(message.payload)
             )
             _process_single_message(message.topic, raw_data)
     except Exception as e:
         logger.error(f"消息处理出错: {e}", exc_info=True)
+    finally:
+        _release_mqtt_claim(claim_key)
 
 def _process_single_message(topic, data):
-    global stream_active, stream_project_name
+    with _mqtt_dispatch_lock:
+        _process_single_message_unsafe(topic, data)
+
+def _process_single_message_unsafe(topic, data):
+    global stream_active, stream_project_name, stream_batch_name
     global stream_comm_sim_rand, stream_comm_sim_opt
     global stream_radar_sim_rand, stream_radar_sim_opt
     global stream_t0_abs, stream_last_t_rel, stream_frame_count
     global finalizing
 
-    # 部署消息处理
     msg_type = _get_message_type(data)
     topic_is_vi_decision = topic == "vi_decision" or topic.startswith("vi_decision/")
     topic_is_pg_finish = topic == "pg_data_processor_finish" or topic.startswith("pg_data_processor_finish/")
 
-    if topic_is_vi_decision:
+    # fusion_end 优先处理：立即取消空闲定时器并触发最终化
+    if msg_type == "fusion_end":
+        _end_fusion_stream(data, topic=topic)
+        return
+
+    # 部署消息处理
+    if _is_deployment_message(msg_type):
+        if not topic_is_vi_decision:
+            logger.warning(
+                "部署消息 topic=%s type=%s project=%s（非 vi_decision，仍按部署流程处理）",
+                topic,
+                msg_type,
+                _extract_project_name(data),
+            )
         if msg_type == "generate":
+            logger.info(
+                "收到部署消息 topic=%s type=%s project=%s",
+                topic, msg_type, _extract_project_name(data),
+            )
             result = run_random_deployment(data)
             send_to_target(result)
             _on_generate_completed()
+            _log_flow_stage_snapshot("generate 完成")
             return
         elif msg_type == "reGenerate":
             proj = _extract_project_name(data)
-            result = run_optimization_deployment(data)
-            send_to_target(result)
-            _on_regenerate_completed(proj)
+            logger.info("收到部署消息 topic=%s type=%s project=%s", topic, msg_type, proj)
+            try:
+                result = run_optimization_deployment(data)
+                send_to_target(result)
+            except Exception:
+                logger.error("reGenerate 处理异常 project=%s", proj, exc_info=True)
+                raise
+            finally:
+                _on_regenerate_completed(proj)
+            _log_flow_stage_snapshot("reGenerate 完成")
             return
         elif msg_type == "jammerStart":
-            result = run_jammer_start_deployment(data)
-            send_to_target(result)
-            _on_regenerate_completed(result.get("ProjectName") or _extract_project_name(data))
+            proj = _extract_project_name(data)
+            logger.info("收到部署消息 topic=%s type=%s project=%s", topic, msg_type, proj)
+            result = None
+            try:
+                result = run_jammer_start_deployment(data)
+                send_to_target(result)
+            except Exception:
+                logger.error("jammerStart 处理异常 project=%s", proj, exc_info=True)
+                raise
+            finally:
+                _on_regenerate_completed((result or {}).get("projectname") or proj)
+            _log_flow_stage_snapshot("jammerStart 完成")
             return
 
     # 手动调试触发最终化
@@ -1212,7 +1596,8 @@ def _process_single_message(topic, data):
     # 融合数据流处理
     is_simdata = False
     if topic_is_pg_finish or topic_is_vi_decision:
-        if msg_type == "simData" and data.get("sensor_type") == "AA00":
+        sensor_type = str(ci_get(data, "sensor_type", "Sensor_Type", default="") or "").upper()
+        if msg_type == "simData" and sensor_type == "AA00":
             is_simdata = True
 
     if is_simdata:
@@ -1221,31 +1606,39 @@ def _process_single_message(topic, data):
                 logger.debug("正在最终化，忽略新到达的 simData 帧")
                 return
 
-        proj = _extract_project_name(data)
+        proj, batch = sync_project_batch(data)
         if not _can_start_decision(proj):
             with _flow_stage_lock:
                 stage = _project_flow_stage.get(proj, {})
                 logger.warning(
-                    "融合数据到达但部署阶段未完成，忽略。project=%s，"
-                    "generate_done=%s，regenerate_done=%s（需先完成 generate+reGenerate 或 jammerStart）",
+                    "融合数据到达但部署阶段未完成，忽略。topic=%s project=%s，"
+                    "generate_done=%s，regenerate_done=%s（需先完成 generate+reGenerate 或 jammerStart）；"
+                    "当前内存中已登记项目=%s",
+                    topic,
                     proj,
                     stage.get("generate_done", False),
                     stage.get("regenerate_done", False),
+                    list(_project_flow_stage.keys()) or "(无)",
                 )
             return
         logger.debug(f"处理 simData，项目: {proj}")
 
-        t_abs = communication_decision.parse_timestamp_to_seconds(data.get('time', ''))
+        frame_time = str(ci_get(data, "time", "Time", default="") or "")
+        t_abs = communication_decision.parse_timestamp_to_seconds(frame_time)
         if t_abs == 0.0:
             t_abs = time.time()
-            logger.warning(f"时间解析失败，使用当前时间: {t_abs}，原始时间串: {data.get('time')}")
+            logger.warning(f"时间解析失败，使用当前时间: {t_abs}，原始时间串: {frame_time}")
 
         with stream_lock:
             if not stream_active or stream_project_name != proj:
-                logger.info(f"开始新数据流，项目: {proj} (原项目: {stream_project_name})")
+                logger.info(
+                    "开始新数据流，项目: %s batch: %s (原项目: %s)",
+                    proj, batch, stream_project_name,
+                )
                 _reset_stream_state(reason="stream_switch")
                 stream_active = True
                 stream_project_name = proj
+                stream_batch_name = batch
                 stream_t0_abs = t_abs
 
                 # 修改：所有步数据回调统一发送到 vi_decision_res
@@ -1254,26 +1647,72 @@ def _process_single_message(topic, data):
                 cb_radar_rand = lambda data: send_to_target(data, "vi_decision_res")
                 cb_radar_opt = lambda data: send_to_target(data, "vi_decision_res")
 
+                has_comm, has_radar = _get_project_jammer_availability(proj)
+                if not has_comm and not has_radar:
+                    logger.error(
+                        "项目 %s 未配置任何干扰机（通信/雷达均为空），无法创建流式模拟器",
+                        proj,
+                    )
+                    _set_system_status(
+                        "error",
+                        proj,
+                        "未配置任何干扰机（通信/雷达均为空）",
+                        reason="simulator_init_failed",
+                    )
+                    _reset_stream_state(reason="error_cleanup", update_status=False)
+                    return
+
                 try:
-                    stream_comm_sim_rand = communication_decision.CommunicationJammerSimulation.create_stream_simulator(
-                        project_name=proj, deployment='random', silent=False, mqtt_callback=cb_comm_rand
+                    stream_comm_sim_rand = None
+                    stream_comm_sim_opt = None
+                    stream_radar_sim_rand = None
+                    stream_radar_sim_opt = None
+
+                    if has_comm:
+                        stream_comm_sim_rand = communication_decision.CommunicationJammerSimulation.create_stream_simulator(
+                            project_name=proj, deployment='random', silent=False, mqtt_callback=cb_comm_rand,
+                            batch_name=batch,
+                        )
+                        stream_comm_sim_opt = communication_decision.CommunicationJammerSimulation.create_stream_simulator(
+                            project_name=proj, deployment='optimized', silent=False, mqtt_callback=cb_comm_opt,
+                            batch_name=batch,
+                        )
+                    else:
+                        logger.info("项目 %s 无通信干扰机，跳过通信流式模拟器", proj)
+
+                    if has_radar:
+                        stream_radar_sim_rand = radar_decision.RadarJammerSimulation.create_stream_simulator(
+                            project_name=proj, deployment='random', silent=False, mqtt_callback=cb_radar_rand,
+                            batch_name=batch,
+                        )
+                        stream_radar_sim_opt = radar_decision.RadarJammerSimulation.create_stream_simulator(
+                            project_name=proj, deployment='optimized', silent=False, mqtt_callback=cb_radar_opt,
+                            batch_name=batch,
+                        )
+                    else:
+                        logger.info("项目 %s 无雷达干扰机，跳过雷达流式模拟器", proj)
+
+                    logger.info(
+                        "流式模拟器创建成功 project=%s（通信=%s，雷达=%s），步数据将发往 vi_decision_res",
+                        proj,
+                        "启用" if has_comm else "跳过",
+                        "启用" if has_radar else "跳过",
                     )
-                    stream_comm_sim_opt = communication_decision.CommunicationJammerSimulation.create_stream_simulator(
-                        project_name=proj, deployment='optimized', silent=False, mqtt_callback=cb_comm_opt
-                    )
-                    stream_radar_sim_rand = radar_decision.RadarJammerSimulation.create_stream_simulator(
-                        project_name=proj, deployment='random', silent=False, mqtt_callback=cb_radar_rand
-                    )
-                    stream_radar_sim_opt = radar_decision.RadarJammerSimulation.create_stream_simulator(
-                        project_name=proj, deployment='optimized', silent=False, mqtt_callback=cb_radar_opt
-                    )
-                    logger.info("流式模拟器（随机+优化）创建成功，所有步数据将发往 vi_decision_res")
                     _set_system_status("running", proj, None, reason="first_simdata_started")
                 except Exception as e:
                     logger.error(f"创建流式模拟器失败: {e}", exc_info=True)
                     _set_system_status("error", proj, str(e), reason="simulator_init_failed")
                     _reset_stream_state(reason="error_cleanup", update_status=False)
                     return
+            else:
+                stream_batch_name = batch
+                for sim in (
+                    stream_comm_sim_rand, stream_comm_sim_opt,
+                    stream_radar_sim_rand, stream_radar_sim_opt,
+                ):
+                    if sim is not None:
+                        sim.project_name = proj
+                        sim.batch_name = batch
 
             t_rel = t_abs - stream_t0_abs
             stream_last_t_rel = t_rel
@@ -1297,22 +1736,6 @@ def _process_single_message(topic, data):
                         _set_system_status("error", proj, f"{name} 增量更新失败: {e}", reason="frame_update_failed")
 
         _reset_idle_timer()
-        return
-
-    if msg_type == "simStop":
-        proj = _extract_project_name(data, default="")
-        with stream_lock:
-            if not stream_active:
-                logger.debug("收到 simStop 但流已非活跃，忽略")
-                return
-        with finalizing_lock:
-            if finalizing:
-                logger.debug("收到 simStop 但已有最终化进程，忽略")
-                return
-        logger.info("收到 simStop，结束数据流")
-        _finalize_stream(idle_reason="normal_finished")
-        if proj:
-            _clear_stage(proj)
         return
 
 @app.route('/api/health', methods=['GET'])
@@ -1361,6 +1784,144 @@ def get_status():
     status_payload["flow_stage"] = _get_current_flow_stage()
     return jsonify(status_payload)
 
+@app.route('/admin', methods=['GET'])
+def admin_config_page():
+    return render_template('admin_config.html')
+
+
+@app.route('/api/config', methods=['GET'])
+def get_runtime_config():
+    config = load_config()
+    with _mqtt_lock:
+        mqtt_connected = _mqtt_connected
+    with _status_lock:
+        system_status = _system_status
+        state_reason = _system_status_reason
+
+    return jsonify({
+        "success": True,
+        "config": public_config(config),
+        "mqtt_connected": mqtt_connected,
+        "system_status": system_status,
+        "state_reason": state_reason,
+        "restart_hint": "修改 PORT / HOST_PORT 后请在宿主机执行: docker compose up -d"
+    })
+
+
+@app.route('/api/config', methods=['POST'])
+def update_runtime_config():
+    payload = request.get_json(silent=True) or {}
+    if not payload:
+        return jsonify({"success": False, "message": "请求体不能为空"}), 400
+
+    current = load_config()
+    updates = {}
+    for key in ("HOST", "PORT", "HOST_PORT", "SOURCE_BROKER", "SOURCE_PORT", "SOURCE_USERNAME", "SOURCE_PASSWORD"):
+        if key in payload and payload[key] is not None:
+            updates[key] = str(payload[key]).strip()
+
+    merged_preview = {**current, **updates}
+    err = validate_config(merged_preview)
+    if err:
+        return jsonify({"success": False, "message": err}), 400
+
+    old_config = dict(current)
+    try:
+        saved = save_config(updates)
+    except OSError as e:
+        logger.error(f"保存配置失败: {e}", exc_info=True)
+        return jsonify({"success": False, "message": f"保存配置失败: {e}"}), 500
+
+    mqtt_keys = {"SOURCE_BROKER", "SOURCE_PORT", "SOURCE_USERNAME", "SOURCE_PASSWORD"}
+    port_keys = {"PORT", "HOST_PORT", "HOST"}
+    mqtt_changed = any(str(old_config.get(k, "")) != str(saved.get(k, "")) for k in mqtt_keys)
+    port_changed = any(str(old_config.get(k, "")) != str(saved.get(k, "")) for k in port_keys)
+
+    mqtt_reloaded = False
+    if mqtt_changed:
+        mqtt_reloaded = reconnect_mqtt()
+
+    messages = ["配置已保存"]
+    if mqtt_changed:
+        messages.append("MQTT 已尝试重连" if mqtt_reloaded else "MQTT 重连失败，请检查 Broker 地址与端口")
+    if port_changed:
+        messages.append("端口配置已更新，需重启容器后生效")
+
+    return jsonify({
+        "success": True,
+        "message": "；".join(messages),
+        "config": public_config(saved),
+        "mqtt_reloaded": mqtt_reloaded,
+        "requires_container_restart": port_changed,
+        "restart_hint": "在宿主机项目目录执行: docker compose up -d"
+    })
+
+
+@app.route('/api/fusion/decision/process/list', methods=['POST'])
+def list_decision_process_simulation():
+    """查询 fusion.decision_result_simulation 中的 projectname、batchname 列表。"""
+    try:
+        data = query_decision_result_project_batch_list()
+        return jsonify({
+            "code": 200,
+            "data": data,
+            "msg": "查询成功",
+        })
+    except Exception as e:
+        logger.error(f"查询 decision_result_simulation 项目批次列表失败: {e}", exc_info=True)
+        return jsonify({
+            "code": 500,
+            "data": {
+                "columnList": [],
+                "data": [],
+                "total": 0,
+            },
+            "msg": f"查询失败: {e}",
+        }), 500
+
+
+@app.route('/api/fusion/decision/result/query', methods=['POST'])
+def query_decision_result_simulation_api():
+    """按 projectname、batchname 查询 fusion.decision_result_simulation。"""
+    payload = request.get_json(silent=True) or {}
+    projectname = str(payload.get("projectname") or "").strip()
+    batchname = str(payload.get("batchname") or "").strip()
+
+    if not projectname or not batchname:
+        return jsonify({
+            "code": 400,
+            "data": {
+                "results": [],
+                "total": 0,
+            },
+            "msg": "projectname 和 batchname 不能为空",
+        }), 400
+
+    try:
+        data = query_decision_result_simulation(projectname, batchname)
+        return jsonify({
+            "code": 200,
+            "data": data,
+            "msg": "查询成功",
+        })
+    except Exception as e:
+        logger.error(
+            "查询 decision_result_simulation 失败: project=%s batch=%s error=%s",
+            projectname,
+            batchname,
+            e,
+            exc_info=True,
+        )
+        return jsonify({
+            "code": 500,
+            "data": {
+                "results": [],
+                "total": 0,
+            },
+            "msg": f"查询失败: {e}",
+        }), 500
+
+
 @app.route('/api/reset', methods=['POST'])
 def reset_system():
     with _status_lock:
@@ -1388,7 +1949,13 @@ if __name__ == '__main__':
     except ValueError:
         logger.warning("环境变量 PORT 非法，回退到默认端口 17686")
         port = 17686
-    logger.info(f"启动部署决策服务（统一主题 vi_decision_res），监听地址: {host}:{port}")
+    logger.info(
+        "启动部署决策服务（统一主题 vi_decision_res），监听地址: %s:%s，pid=%s，mqtt_client_id=%s",
+        host,
+        port,
+        os.getpid(),
+        app.config.get('MQTT_CLIENT_ID'),
+    )
     try:
         from waitress import serve
         logger.info("使用 Waitress 作为 WSGI 服务启动")

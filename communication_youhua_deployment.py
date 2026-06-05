@@ -353,25 +353,19 @@ class JammerOptimization:
         return total_ratio / count if count > 0 else 0.0
 
     def objective_function(self, positions):
-        """
-        PSO 目标函数：最小化
-        权重：要地覆盖率 0.4，干扰覆盖率 0.4，干扰机重叠率 0.2
-        """
         num_jammers = len(self.original_jammers_xy)
         jammers_xy = []
         for i in range(num_jammers):
             x = positions[i * 2]
             y = positions[i * 2 + 1]
             if math.hypot(x, y) > self.effective_radius:
-                return 1e6   # 超出有效部署区域，惩罚
+                return 1e6
             jammers_xy.append({'x': x, 'y': y})
-
-        guard_cov = self.calculate_guard_coverage(jammers_xy)      # 要地覆盖率
-        overlap = self.calculate_jammer_overlap(jammers_xy)        # 重叠率
-        jammer_cov = self.calculate_jammer_coverage(jammers_xy)    # 干扰覆盖率
-
-        # 目标值 = 0.4*(1-guard_cov) + 0.2*overlap + 0.4*(1-jammer_cov)
-        return 0.4 * (1 - guard_cov) + 0.2 * overlap + 0.4 * (1 - jammer_cov)
+        guard_cov = self.calculate_guard_coverage(jammers_xy)
+        area_cov = self.calculate_jammer_coverage(jammers_xy)
+        overlap = self.calculate_jammer_overlap(jammers_xy)
+        # 目标：最大化覆盖、最小化重叠（权重与雷达优化一致）
+        return 0.4*(1-guard_cov) + 0.4*(1-area_cov) + 0.2*overlap
 
     def optimize_jammer_positions(self):
         """使用 PSO 算法优化干扰机位置"""

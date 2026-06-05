@@ -13,6 +13,13 @@ from typing import List, Dict, Any, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
+from field_utils import (
+    DEFAULT_BATCH,
+    DEFAULT_PROJECT,
+    ci_get,
+    format_compact_time_at_offset,
+)
+
 from radar_jamming_range_calculation import (
     RadarParams, JammerRadarParams,
     _calculate_jamming_success_rate_vectorized
@@ -203,7 +210,7 @@ class RadarJammerSimulation:
 
     @classmethod
     def create_stream_simulator(cls, project_name: str, deployment: str = 'optimized', silent: bool = True,
-                                mqtt_callback=None):
+                                mqtt_callback=None, batch_name: str = None):
         config_dir = os.path.dirname(os.path.abspath(__file__))
         jammer_file = os.path.join(config_dir, "data", project_name, "radar_jammer_positions.json")
         if not os.path.exists(jammer_file):
@@ -218,6 +225,10 @@ class RadarJammerSimulation:
 
         with open(jammer_file, 'r', encoding='utf-8') as f:
             sim.radar_data = json.load(f)
+
+        scene = sim.radar_data.get("scene") or {}
+        sim.project_name = project_name or ci_get(scene, "projectname", "ProjectName") or DEFAULT_PROJECT
+        sim.batch_name = batch_name or ci_get(scene, "batchname", "batchName", "batch") or DEFAULT_BATCH
 
         sim.radius_suppressive = find_radar_distance_for_success_rate('suppressive', 0.7)
         sim.radius_deceptive = find_radar_distance_for_success_rate('deceptive', 0.7)
@@ -352,7 +363,7 @@ class RadarJammerSimulation:
 
         # 初始化绝对时间基准（精确到毫秒）
         if self.sim_start_datetime is None:
-            time_str = frame.get('time', '')
+            time_str = str(ci_get(frame, "time", "Time", default="") or "")
             frame_dt = parse_timestamp_to_datetime(time_str)
             if frame_dt:
                 self.sim_start_datetime = frame_dt - timedelta(seconds=t_rel)
@@ -419,15 +430,13 @@ class RadarJammerSimulation:
         self._save_data(t)
 
     def _save_data(self, t: float):
-        """保存当前时间步的干扰机状态，并可选发送 MQTT。时间精确到毫秒"""
-        if self.sim_start_datetime:
-            abs_time = self.sim_start_datetime + timedelta(seconds=t)
-            time_str = abs_time.strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]
-        else:
-            time_str = f"{t:.1f}"
+        """保存当前时间步的干扰机状态，并可选发送 MQTT。时间为 YYYYMMDDHHMMSSmmm。"""
+        time_str = format_compact_time_at_offset(self.sim_start_datetime, t)
 
         data = {
             "type": f"radar_{self.deployment}",
+            "projectname": getattr(self, "project_name", DEFAULT_PROJECT),
+            "batchname": getattr(self, "batch_name", DEFAULT_BATCH),
             "time": time_str,
             "jammers": []
         }

@@ -13,6 +13,13 @@ from typing import List, Dict, Any, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
+from field_utils import (
+    DEFAULT_BATCH,
+    DEFAULT_PROJECT,
+    ci_get,
+    format_compact_time_at_offset,
+)
+
 try:
     from jamming_success_rate import JammerParams, TargetParams, jamming_success_rate
     JAMMING_MODEL_AVAILABLE = True
@@ -181,7 +188,7 @@ class CommunicationJammerSimulation:
 
     @classmethod
     def create_stream_simulator(cls, project_name: str, deployment: str = 'optimized', silent: bool = True,
-                                mqtt_callback=None):
+                                mqtt_callback=None, batch_name: str = None):
         config_dir = os.path.dirname(os.path.abspath(__file__))
         jammer_file = os.path.join(config_dir, "data", project_name, "communication_jammer_positions.json")
         if not os.path.exists(jammer_file):
@@ -196,6 +203,10 @@ class CommunicationJammerSimulation:
 
         with open(jammer_file, 'r', encoding='utf-8') as f:
             sim.comm_data = json.load(f)
+
+        scene = sim.comm_data.get("scene") or {}
+        sim.project_name = project_name or ci_get(scene, "projectname", "ProjectName") or DEFAULT_PROJECT
+        sim.batch_name = batch_name or ci_get(scene, "batchname", "batchName", "batch") or DEFAULT_BATCH
 
         sim.radius_suppressive = find_distance_for_success_rate('suppressive', 0.7)
         sim.radius_deceptive = find_distance_for_success_rate('deceptive', 0.7)
@@ -329,7 +340,7 @@ class CommunicationJammerSimulation:
 
         # 初始化绝对时间基准（精确到毫秒）
         if self.sim_start_datetime is None:
-            time_str = frame.get('time', '')
+            time_str = str(ci_get(frame, "time", "Time", default="") or "")
             frame_dt = parse_timestamp_to_datetime(time_str)
             if frame_dt:
                 self.sim_start_datetime = frame_dt - timedelta(seconds=t_rel)
@@ -396,15 +407,13 @@ class CommunicationJammerSimulation:
         self._save_data(t)
 
     def _save_data(self, t: float):
-        """保存当前时间步的干扰机状态，并可选发送 MQTT。时间精确到毫秒"""
-        if self.sim_start_datetime:
-            abs_time = self.sim_start_datetime + timedelta(seconds=t)
-            time_str = abs_time.strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]  # 保留三位毫秒
-        else:
-            time_str = f"{t:.1f}"
+        """保存当前时间步的干扰机状态，并可选发送 MQTT。时间为 YYYYMMDDHHMMSSmmm。"""
+        time_str = format_compact_time_at_offset(self.sim_start_datetime, t)
 
         data = {
             "type": f"communication_{self.deployment}",
+            "projectname": getattr(self, "project_name", DEFAULT_PROJECT),
+            "batchname": getattr(self, "batch_name", DEFAULT_BATCH),
             "time": time_str,
             "jammers": []
         }
@@ -454,11 +463,13 @@ class CommunicationJammerSimulation:
         coverage_gain = {}
         for jammer in self.jammers:
             for target in active_targets:
-                jtype, success, dist, az, el, eff_rad = self._evaluate_jammer_for_target(jammer, target, current_time)
+                jtype, success, dist, az, el, eff_rad, mode = self._evaluate_jammer_for_target(
+                    jammer, target, current_time
+                )
                 if jtype is not None:
                     feasible[(jammer.id, target.id)] = True
                     jam_type_dict[(jammer.id, target.id)] = jtype
-                    info[(jammer.id, target.id)] = (success, dist, az, el, eff_rad)
+                    info[(jammer.id, target.id)] = (success, dist, az, el, eff_rad, mode)
                     target_potential = self._calculate_target_coverage_potential(target, current_time)
                     coverage_gain[(jammer.id, target.id)] = target.threat_value * target_potential
                 else:
@@ -487,8 +498,8 @@ class CommunicationJammerSimulation:
                         best_jtype = jam_type_dict[(jammer.id, target.id)]
                         best_info = info[(jammer.id, target.id)]
             if best_jammer is not None:
-                success, dist, az, el, eff_rad = best_info
-                assignments[best_jammer] = (target.id, best_jtype, az, el, dist, eff_rad)
+                success, dist, az, el, eff_rad, mode = best_info
+                assignments[best_jammer] = (target.id, best_jtype, az, el, dist, eff_rad, mode)
                 unassigned_jammers.remove(best_jammer)
 
         for jammer in list(unassigned_jammers):
@@ -505,16 +516,17 @@ class CommunicationJammerSimulation:
                         best_jtype = jam_type_dict[(jammer.id, target.id)]
                         best_info = info[(jammer.id, target.id)]
             if best_target is not None:
-                success, dist, az, el, eff_rad = best_info
-                assignments[jammer] = (best_target.id, best_jtype, az, el, dist, eff_rad)
+                success, dist, az, el, eff_rad, mode = best_info
+                assignments[jammer] = (best_target.id, best_jtype, az, el, dist, eff_rad, mode)
                 unassigned_jammers.remove(jammer)
 
         for jammer in self.jammers:
             if jammer in assignments:
-                target_id, jtype, az, el, dist, eff_rad = assignments[jammer]
+                target_id, jtype, az, el, dist, eff_rad, mode = assignments[jammer]
                 jammer.active = True
                 jammer.current_target_id = target_id
                 jammer.jam_type = jtype
+                jammer.mode = mode
                 jammer.pointing_azimuth = az
                 jammer.pointing_elevation = el
                 jammer.effective_radius = eff_rad
@@ -524,15 +536,18 @@ class CommunicationJammerSimulation:
                 jammer.effective_radius = 0.0
 
     def _evaluate_jammer_for_target(self, jammer, target, current_time):
-        if target.has_finished(current_time): return None, 0, None, None, None, None
+        if target.has_finished(current_time):
+            return None, 0, None, None, None, None, None
         pos = target.current_position_xy(current_time)
-        if pos[0] is None: return None, 0, None, None, None, None
+        if pos[0] is None:
+            return None, 0, None, None, None, None, None
         tx, ty, talt = pos
         dx = tx - jammer.x
         dy = ty - jammer.y
         dz = talt - jammer.alt
         dist = math.hypot(dx, dy)
-        if dist > 100000: return None, 0, None, None, None, None
+        if dist > 100000:
+            return None, 0, None, None, None, None, None
         azimuth = math.degrees(math.atan2(dx, dy)) % 360
         elevation = math.degrees(math.atan2(dz, dist)) if dist > 0 else (90 if dz > 0 else -90)
 
@@ -543,19 +558,34 @@ class CommunicationJammerSimulation:
             jam_type = 'deceptive'
             effective_radius = self.radius_deceptive
         else:
-            return None, 0, None, None, None, None
+            return None, 0, None, None, None, None, None
 
         target_freq = target.comm_center_freq_hz
+        candidate_strategies = [s for s in self.comm_strategies if s['jam_type'] == jam_type]
+        if not candidate_strategies:
+            return None, 0, None, None, None, None, None
+
         best_strategy = None
         min_freq_diff = float('inf')
-        for strat in self.comm_strategies:
+        for strat in candidate_strategies:
             strat_freq = strat['params'].get('center_freq_mhz', 0) * 1e6
             freq_diff = abs(strat_freq - target_freq)
             if freq_diff < min_freq_diff:
                 min_freq_diff = freq_diff
                 best_strategy = strat
 
-        return jam_type, self.fixed_success_rate, dist, azimuth, elevation, effective_radius
+        if best_strategy is None:
+            return None, 0, None, None, None, None, None
+
+        return (
+            jam_type,
+            self.fixed_success_rate,
+            dist,
+            azimuth,
+            elevation,
+            effective_radius,
+            best_strategy['mode'],
+        )
 
     def _calculate_target_coverage_potential(self, target, current_time):
         if target.has_finished(current_time): return 0
